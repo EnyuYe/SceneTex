@@ -15,12 +15,25 @@ sys.path.append(".")
 from models.pipeline.texture_pipeline import TexturePipeline
 
 # Setup
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda:0")
-    torch.cuda.set_device(DEVICE)
-else:
-    print("no gpu avaiable")
-    exit()
+import torch.distributed as dist  
+from torch.nn.parallel import DistributedDataParallel as DDP  
+  
+def setup_distributed():  
+    if torch.cuda.is_available():  
+        device_count = torch.cuda.device_count()  
+        if device_count > 1:  
+            # 初始化分布式训练  
+            dist.init_process_group(backend='nccl')  
+            local_rank = int(os.environ['LOCAL_RANK'])  
+            torch.cuda.set_device(local_rank)  
+            return torch.device(f"cuda:{local_rank}")  
+        else:  
+            return torch.device("cuda:0")  
+    else:  
+        print("no gpu available")  
+        exit()  
+  
+DEVICE = setup_distributed()
 
 def init_args():
     parser = argparse.ArgumentParser()
@@ -59,20 +72,21 @@ def init_config(args):
     return config
 
 
-def init_pipeline(
-        config,
-        stamp,
-        device=DEVICE,
-        inference_mode=False
-    ):
-    pipeline = TexturePipeline(
-        config=config,
-        stamp=stamp,
-        device=device
-    ).to(device)
-
-    pipeline.configure(inference_mode=inference_mode)
-
+def init_pipeline(config, stamp, device=DEVICE, inference_mode=False):  
+    pipeline = TexturePipeline(  
+        config=config,  
+        stamp=stamp,  
+        device=device,  
+        local_rank=dist.get_rank() if dist.is_initialized() else 0,  
+        world_size=dist.get_world_size() if dist.is_initialized() else 1  
+    ).to(device)  
+      
+    pipeline.configure(inference_mode=inference_mode)  
+      
+    # 如果是分布式训练，包装为DDP  
+    if dist.is_initialized() and not inference_mode:  
+        pipeline = DDP(pipeline, device_ids=[device.index])  
+      
     return pipeline
 
 if __name__ == "__main__":
@@ -90,7 +104,6 @@ if __name__ == "__main__":
 
     print("=> initializing pipeline...")
     pipeline = init_pipeline(config=config, stamp=args.stamp, inference_mode=inference_mode)
-
     if not inference_mode:
         print("=> start training...")
         with torch.autograd.set_detect_anomaly(True):

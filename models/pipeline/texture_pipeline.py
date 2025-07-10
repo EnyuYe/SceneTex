@@ -1,3 +1,7 @@
+import addon_utils
+addon_utils.enable("io_scene_obj")
+
+
 import random
 import wandb
 import json
@@ -39,21 +43,16 @@ sys.path.append("./lib")
 from models.modules import TextureMesh, Studio, Guidance
 
 class TexturePipeline(nn.Module):
-    def __init__(self, 
-        config,
-        stamp,
-        device
-    ): 
-        
-        super().__init__()
-
-        self.config = config
-        self.stamp = stamp
-
-        self.prompt = config.prompt + ", " + config.a_prompt if config.a_prompt else config.prompt
-        self.n_prompt = config.n_prompt
-        
-        self.device = device
+    def __init__(self, config, stamp, device, local_rank=0, world_size=1):  
+        super().__init__()  
+        self.config = config  
+        self.stamp = stamp  
+        self.device = device  
+        self.local_rank = local_rank  
+        self.world_size = world_size  
+          
+        # 其他初始化代码保持不变  
+        self.prompt = config.prompt + ", " + config.a_prompt if config.a_prompt else config.prompt  
         self.weights_dtype = torch.float16 if self.config.enable_half_precision else torch.float32
         print("=> Use precision: {}".format(self.weights_dtype))
 
@@ -152,21 +151,23 @@ class TexturePipeline(nn.Module):
     def _get_guidance_parameters(self):
         return [p for p in self.guidance.unet_phi_layers.parameters() if p.requires_grad]
 
-    def _configure_optimizers(self):
-        texture_params = self._get_texture_parameters()
-
-        print("=> Total number of trainable parameters for texture: {}".format(
-            sum(p.numel() for p in texture_params if p.requires_grad)))
-
-        self.texture_optimizer = AdamW(texture_params, lr=self.config.latent_lr)
-
-        if self.config.loss_type == "vsd":
-            guidance_params = self._get_guidance_parameters()
-
-            print("=> Number of trainable parameters of phi model: {}".format(
-                sum(p.numel() for p in guidance_params if p.requires_grad)))
-
-            self.phi_optimizer = AdamW(guidance_params, lr=self.config.phi_lr)
+    def _configure_optimizers(self):  
+        texture_params = self._get_texture_parameters()  
+        
+        # 分布式训练时调整学习率  
+        lr_scale = self.world_size if self.world_size > 1 else 1  
+        
+        self.texture_optimizer = AdamW(  
+            texture_params,   
+            lr=self.config.latent_lr * lr_scale  
+        )  
+        
+        if self.config.loss_type == "vsd":  
+            guidance_params = self._get_guidance_parameters()  
+            self.phi_optimizer = AdamW(  
+                guidance_params,   
+                lr=self.config.phi_lr * lr_scale  
+            )
 
     def _downsample(self, inputs, in_size, out_size, mode="direct", type_="interpolate"):
         if mode == "iterative":
@@ -335,7 +336,9 @@ class TexturePipeline(nn.Module):
 
         for step, chosen_t in enumerate(pbar):
 
-            Rs, Ts, fovs, ids = self.studio.sample_cameras(step, self.config.batch_size, self.config.use_random_cameras)
+            effective_batch_size = self.config.batch_size * self.world_size if hasattr(self, 'world_size') and self.world_size > 1 else self.config.batch_size  
+
+            Rs, Ts, fovs, ids = self.studio.sample_cameras(step, effective_batch_size, self.config.use_random_cameras)
             cameras = self.studio.set_cameras(Rs, Ts, fovs, self.config.render_size)
             latents, _, _, rel_depth_normalized = self.forward(cameras, is_direct=("hashgrid" not in self.config.texture_type))
             t, noise, noisy_latents, _ = self.guidance.prepare_latents(latents, chosen_t, self.config.batch_size)
@@ -351,6 +354,11 @@ class TexturePipeline(nn.Module):
                 )
 
                 sds_loss.backward()
+
+                if hasattr(self, 'world_size') and self.world_size > 1:  
+                    torch.distributed.all_reduce(vsd_loss)  
+                    vsd_loss /= self.world_size
+                
                 self.texture_optimizer.step()
 
                 vsd_loss = sds_loss
@@ -368,6 +376,11 @@ class TexturePipeline(nn.Module):
                 )
 
                 vsd_loss.backward()
+
+                if hasattr(self, 'world_size') and self.world_size > 1:  
+                    torch.distributed.all_reduce(vsd_phi_loss)  
+                    vsd_phi_loss /= self.world_size
+
                 self.texture_optimizer.step()
 
 
